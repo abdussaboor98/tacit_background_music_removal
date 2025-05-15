@@ -184,24 +184,56 @@ def evaluate(model, dataloader, loss_fn_eval, metrics_dict, device, desc="Evalua
                     # ConvTasNet outputs a list of source estimates
                     # Convert to the format expected by torchmetrics SI-SNR [B, S, T]
                     # Where S is the number of sources
-                    s_est_stacked = torch.stack([
-                        s_estimates[0],  # speech estimates
-                        s_estimates[1]   # music estimates
-                    ], dim=1).to(device)
                     
-                    # Convert targets to the right format for SI-SNR metric
-                    if targets.dim() == 4:  # (B, S, C, T)
-                        if targets.shape[2] == 1:
-                            targets_for_metric = targets.squeeze(2).to(device)  # (B, S, T)
-                        else:
-                            targets_for_metric = targets.mean(dim=2).to(device)  # (B, S, T)
+                    # Get minimum length to avoid dimension mismatch
+                    min_len = min(s_estimates[0].shape[-1], s_estimates[1].shape[-1])
+                    min_len = min(min_len, targets.shape[-1])  # Also check target length
+                    
+                    # Trim lengths
+                    s_estimates[0] = s_estimates[0][..., :min_len]
+                    s_estimates[1] = s_estimates[1][..., :min_len]
+                    
+                    # Stack sources and ensure batch dimension
+                    if s_estimates[0].ndim == 1:  # [T]
+                        speech_est = s_estimates[0].unsqueeze(0)  # [1, T]
+                        music_est = s_estimates[1].unsqueeze(0)   # [1, T]
                     else:
-                        targets_for_metric = targets.to(device)
+                        speech_est = s_estimates[0]  # Already [B, T]
+                        music_est = s_estimates[1]   # Already [B, T]
+                    
+                    # Stack along source dimension to get [B, S, T]
+                    s_est_stacked = torch.stack([speech_est, music_est], dim=1).to(device)
+                    
+                    # Explicitly show shape
+                    print(f"Initial s_est_stacked shape: {s_est_stacked.shape}")
+                    
+                    # Check if dimensions are swapped (happens in some cases)
+                    if s_est_stacked.shape[1] > 2 and s_est_stacked.shape[2] == 2:
+                        print("Transposing s_est_stacked dimensions...")
+                        s_est_stacked = s_est_stacked.transpose(1, 2)  # Swap to [B, S, T]
+                    
+                    # Extract targets properly - handle all dimension cases
+                    if targets.dim() == 4:  # [B, S, C, T]
+                        if targets.shape[2] == 1:  # Single channel
+                            # Extract only the time we need
+                            speech_tgt = targets[:, 0, 0, :min_len]  # [B, T]
+                            music_tgt = targets[:, 1, 0, :min_len]   # [B, T] 
+                        else:  # Multiple channels
+                            speech_tgt = targets[:, 0, :, :min_len].mean(dim=1)  # [B, T]
+                            music_tgt = targets[:, 1, :, :min_len].mean(dim=1)   # [B, T]
+                        
+                        # Stack to get [B, S, T]
+                        targets_for_metric = torch.stack([speech_tgt, music_tgt], dim=1).to(device)
+                    else:
+                        raise ValueError(f"Unexpected target shape: {targets.shape}")
+                    
+                    print(f"Final shapes: s_est_stacked={s_est_stacked.shape}, targets_for_metric={targets_for_metric.shape}")
                     
                     # Update metric with prepared tensors
                     metrics_dict["SI-SNR"].update(s_est_stacked, targets_for_metric)
                 except Exception as e:
                     print(f"Warning: SI-SNR calculation failed: {e}")
+                    print(f"Shapes: s_estimates[0]={s_estimates[0].shape}, s_estimates[1]={s_estimates[1].shape}, targets={targets.shape}")
                     
             # --- Get estimated sources for metric calculation ---
             speech_est = s_estimates[loss_fn_eval.speech_target_index]  # (B, T)
@@ -221,18 +253,81 @@ def evaluate(model, dataloader, loss_fn_eval, metrics_dict, device, desc="Evalua
             speech_est_trim = speech_est[..., :min_len]
             speech_tgt_trim = speech_tgt[..., :min_len]
 
-            # REMOVED: Validation check that was causing IndexError
-            # Use all samples directly for metrics calculation
+            # Sample rate for metrics
             sample_rate = getattr(loss_fn_eval, 'sample_rate', 8000)
             pesq_key = f"PESQ-{'WB' if sample_rate == 16000 else 'NB'}" # Access sr from loss
             
             if pesq_key in metrics_dict:
-                try: metrics_dict[pesq_key].update(speech_est_trim, speech_tgt_trim)
-                except Exception as e: print(f"Warning: PESQ calculation failed: {e}")
+                try: 
+                    # Print original shapes
+                    print(f"Original PESQ shapes: est={speech_est_trim.shape}, tgt={speech_tgt_trim.shape}")
+                    
+                    # Handle batch dimension more carefully
+                    if speech_est_trim.ndim == 1:  # [T]
+                        speech_est_trim_batch = speech_est_trim.unsqueeze(0)  # [1, T]
+                    else:
+                        speech_est_trim_batch = speech_est_trim  # Already has batch
+                    
+                    if speech_tgt_trim.ndim == 1:  # [T]
+                        speech_tgt_trim_batch = speech_tgt_trim.unsqueeze(0)  # [1, T]
+                    else:
+                        speech_tgt_trim_batch = speech_tgt_trim  # Already has batch
+                    
+                    # Final check to ensure same shapes
+                    if speech_est_trim_batch.shape != speech_tgt_trim_batch.shape:
+                        print(f"Shapes still don't match: {speech_est_trim_batch.shape} vs {speech_tgt_trim_batch.shape}")
+                        # If one has batch and one doesn't, add batch to the one that doesn't
+                        if speech_est_trim_batch.ndim < speech_tgt_trim_batch.ndim:
+                            speech_est_trim_batch = speech_est_trim_batch.unsqueeze(0)
+                        elif speech_tgt_trim_batch.ndim < speech_est_trim_batch.ndim:
+                            speech_tgt_trim_batch = speech_tgt_trim_batch.unsqueeze(0)
+                        
+                        # One last minimum length check
+                        min_len = min(speech_est_trim_batch.shape[-1], speech_tgt_trim_batch.shape[-1])
+                        speech_est_trim_batch = speech_est_trim_batch[..., :min_len]
+                        speech_tgt_trim_batch = speech_tgt_trim_batch[..., :min_len]
+                    
+                    print(f"Final PESQ shapes: est={speech_est_trim_batch.shape}, tgt={speech_tgt_trim_batch.shape}")
+                    metrics_dict[pesq_key].update(speech_est_trim_batch, speech_tgt_trim_batch)
+                except Exception as e: 
+                    print(f"Warning: PESQ calculation failed: {e}")
+                    print(f"PESQ shapes: est={speech_est_trim.shape}, tgt={speech_tgt_trim.shape}")
             
             if "STOI" in metrics_dict:
-                try: metrics_dict["STOI"].update(speech_est_trim, speech_tgt_trim)
-                except Exception as e: print(f"Warning: STOI calculation failed: {e}")
+                try: 
+                    # Print original shapes
+                    print(f"Original STOI shapes: est={speech_est_trim.shape}, tgt={speech_tgt_trim.shape}")
+                    
+                    # Handle batch dimension more carefully
+                    if speech_est_trim.ndim == 1:  # [T]
+                        speech_est_trim_batch = speech_est_trim.unsqueeze(0)  # [1, T]
+                    else:
+                        speech_est_trim_batch = speech_est_trim  # Already has batch
+                    
+                    if speech_tgt_trim.ndim == 1:  # [T]
+                        speech_tgt_trim_batch = speech_tgt_trim.unsqueeze(0)  # [1, T]
+                    else:
+                        speech_tgt_trim_batch = speech_tgt_trim  # Already has batch
+                    
+                    # Final check to ensure same shapes
+                    if speech_est_trim_batch.shape != speech_tgt_trim_batch.shape:
+                        print(f"Shapes still don't match: {speech_est_trim_batch.shape} vs {speech_tgt_trim_batch.shape}")
+                        # If one has batch and one doesn't, add batch to the one that doesn't
+                        if speech_est_trim_batch.ndim < speech_tgt_trim_batch.ndim:
+                            speech_est_trim_batch = speech_est_trim_batch.unsqueeze(0)
+                        elif speech_tgt_trim_batch.ndim < speech_est_trim_batch.ndim:
+                            speech_tgt_trim_batch = speech_tgt_trim_batch.unsqueeze(0)
+                        
+                        # One last minimum length check
+                        min_len = min(speech_est_trim_batch.shape[-1], speech_tgt_trim_batch.shape[-1])
+                        speech_est_trim_batch = speech_est_trim_batch[..., :min_len]
+                        speech_tgt_trim_batch = speech_tgt_trim_batch[..., :min_len]
+                    
+                    print(f"Final STOI shapes: est={speech_est_trim_batch.shape}, tgt={speech_tgt_trim_batch.shape}")
+                    metrics_dict["STOI"].update(speech_est_trim_batch, speech_tgt_trim_batch)
+                except Exception as e: 
+                    print(f"Warning: STOI calculation failed: {e}")
+                    print(f"STOI shapes: est={speech_est_trim.shape}, tgt={speech_tgt_trim.shape}")
 
     # Compute final metric values
     if num_samples > 0:
@@ -1105,7 +1200,7 @@ def train(args):
             # Run evaluation on test set using the test dataloader
             test_results = evaluate(test_model, test_loader, test_loss_fn, test_metrics, device, 
                                    desc="Testing (best model)", max_batches=0) # Pass test_loader
-
+            
             print("\n" + "=" * 70)
             print(" FINAL TEST RESULTS ".center(70, "="))
             print("=" * 70)

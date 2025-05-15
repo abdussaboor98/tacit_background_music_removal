@@ -137,29 +137,57 @@ class MSHybridAEDirectLoss(nn.Module):
     and optional Mel Spectrogram loss for speech.
     Designed specifically for the MSHybridNet autoencoder architecture.
     """
-    def __init__(self, mix_recon_weight=0.1, mel_loss_weight=0.1,
-                 speech_target_index=0, music_target_index=1, # Fixed indices
-                 include_music_loss=False, # Flag to include music loss in backprop
+    def __init__(self, 
+                 speech_sisnr_loss_weight=1.0, music_sisnr_loss_weight=0.0, # SI-SNR weights
+                 mix_recon_weight=0.1, mel_loss_weight=0.1,              # Mixture and Mel weights
+                 speech_recon_weight=0.0, music_recon_weight=0.0,         # Source L1 Recon weights
+                 speech_target_index=0, music_target_index=1,             # Fixed indices
                  sample_rate=8000, n_fft=512, hop_length=128, n_mels=80):
         super().__init__()
+        self.speech_sisnr_loss_weight = speech_sisnr_loss_weight
+        self.music_sisnr_loss_weight = music_sisnr_loss_weight
         self.mix_recon_weight = mix_recon_weight
-        self.mel_loss_weight = mel_loss_weight
+        self.mel_loss_weight = mel_loss_weight # This will be updated by decay if enabled in train loop
+        self.speech_recon_weight = speech_recon_weight
+        self.music_recon_weight = music_recon_weight
+        
         self.speech_target_index = speech_target_index
         self.music_target_index = music_target_index
-        self.include_music_loss = include_music_loss
-        self.sample_rate = sample_rate  # Store sample_rate as an instance attribute
+        self.sample_rate = sample_rate
 
-        if self.mel_loss_weight > 0:
+        # Initialize loss functions based on whether their initial weights are > 0
+        # The actual mel_loss_weight can be decayed later during training.
+        if self.mel_loss_weight > 0: 
             self.mel_loss_fn = MelSpectrogramLoss(sample_rate=sample_rate, n_fft=n_fft,
                                                   hop_length=hop_length, n_mels=n_mels)
         else:
             self.mel_loss_fn = None
-        self.mix_recon_loss_fn = nn.L1Loss() # Using L1 for mixture reconstruction
+            
+        if self.mix_recon_weight > 0:
+            self.mix_recon_loss_fn = nn.L1Loss()
+        else:
+            self.mix_recon_loss_fn = None
+            
+        if self.speech_recon_weight > 0:
+            self.speech_recon_loss_fn = nn.L1Loss()
+        else:
+            self.speech_recon_loss_fn = None
+            
+        if self.music_recon_weight > 0:
+            self.music_recon_loss_fn = nn.L1Loss()
+        else:
+            self.music_recon_loss_fn = None
 
     def to(self, device):
         super().to(device)
         if self.mel_loss_fn is not None:
             self.mel_loss_fn = self.mel_loss_fn.to(device)
+        if self.mix_recon_loss_fn is not None:
+            self.mix_recon_loss_fn = self.mix_recon_loss_fn.to(device)
+        if self.speech_recon_loss_fn is not None:
+            self.speech_recon_loss_fn = self.speech_recon_loss_fn.to(device)
+        if self.music_recon_loss_fn is not None:
+            self.music_recon_loss_fn = self.music_recon_loss_fn.to(device)
         return self
 
     def forward(self, s_estimates, targets, mix_estimate, mix_target):
@@ -195,36 +223,62 @@ class MSHybridAEDirectLoss(nn.Module):
         music_est = s_estimates_mono[:, self.music_target_index, :]
         music_tgt = targets_mono[:, self.music_target_index, :]
 
-        # 1. Speech SI-SNR Loss (potentially for gradient)
-        batch_loss_sisnr_speech = si_snr_loss_manual(speech_est, speech_tgt) # (B,)
-        avg_loss_sisnr_speech = torch.mean(batch_loss_sisnr_speech) # Scalar mean
+        # Initialize all raw loss components to zero tensors
+        avg_loss_sisnr_speech_raw = torch.tensor(0.0, device=device)
+        avg_loss_sisnr_music_raw = torch.tensor(0.0, device=device)
+        loss_mix_recon_raw = torch.tensor(0.0, device=device)
+        loss_mel_speech_raw = torch.tensor(0.0, device=device)
+        loss_speech_recon_raw = torch.tensor(0.0, device=device)
+        loss_music_recon_raw = torch.tensor(0.0, device=device)
+        
+        total_loss = torch.tensor(0.0, device=device)
 
-        # 2. Music SI-SNR Calculation (potentially for gradient or monitoring)
-        batch_loss_sisnr_music = si_snr_loss_manual(music_est, music_tgt) # (B,)
-        avg_loss_sisnr_music = torch.mean(batch_loss_sisnr_music) # Scalar mean
+        # 1. Speech SI-SNR Loss
+        if self.speech_sisnr_loss_weight > 0:
+            # Note: si_snr_loss_manual returns negative SI-SNR
+            avg_loss_sisnr_speech_raw = torch.mean(si_snr_loss_manual(speech_est, speech_tgt))
+            total_loss += self.speech_sisnr_loss_weight * avg_loss_sisnr_speech_raw
+
+        # 2. Music SI-SNR Calculation
+        if self.music_sisnr_loss_weight > 0:
+            avg_loss_sisnr_music_raw = torch.mean(si_snr_loss_manual(music_est, music_tgt))
+            total_loss += self.music_sisnr_loss_weight * avg_loss_sisnr_music_raw
 
         # 3. Mixture Reconstruction Loss
-        min_len_mix = min(mix_estimate_mono.shape[-1], mix_target_mono.shape[-1])
-        loss_mix_recon = self.mix_recon_loss_fn(
-            mix_estimate_mono[..., :min_len_mix],
-            mix_target_mono[..., :min_len_mix]
-        ) # Scalar
+        if self.mix_recon_weight > 0 and self.mix_recon_loss_fn is not None:
+            min_len_mix = min(mix_estimate_mono.shape[-1], mix_target_mono.shape[-1])
+            loss_mix_recon_raw = self.mix_recon_loss_fn(
+                mix_estimate_mono[..., :min_len_mix],
+                mix_target_mono[..., :min_len_mix]
+            )
+            total_loss += self.mix_recon_weight * loss_mix_recon_raw
 
-        # 4. Mel Loss (Speech only)
-        loss_mel_speech = torch.tensor(0.0).to(device)
-        if self.mel_loss_fn is not None and self.mel_loss_weight > 0:
-            self.mel_loss_fn = self.mel_loss_fn.to(device) # Ensure device
-            loss_mel_speech = self.mel_loss_fn(speech_est, speech_tgt) # Scalar
+        # 4. Mel Loss (Speech only) - self.mel_loss_weight is the current runtime weight (after decay)
+        if self.mel_loss_weight > 0 and self.mel_loss_fn is not None:
+            # self.mel_loss_fn = self.mel_loss_fn.to(device) # Already handled by module.to()
+            loss_mel_speech_raw = self.mel_loss_fn(speech_est, speech_tgt)
+            total_loss += self.mel_loss_weight * loss_mel_speech_raw
+        
+        # 5. Speech L1 Reconstruction Loss
+        if self.speech_recon_weight > 0 and self.speech_recon_loss_fn is not None:
+            min_len_speech = min(speech_est.shape[-1], speech_tgt.shape[-1])
+            loss_speech_recon_raw = self.speech_recon_loss_fn(
+                speech_est[..., :min_len_speech],
+                speech_tgt[..., :min_len_speech]
+            )
+            total_loss += self.speech_recon_weight * loss_speech_recon_raw
 
-        # 5. --- Combine Losses for Backpropagation ---
-        total_loss = avg_loss_sisnr_speech # Start with speech SI-SNR loss
-        if self.include_music_loss:
-            total_loss += avg_loss_sisnr_music # Add music SI-SNR loss if requested
-        total_loss += self.mix_recon_weight * loss_mix_recon
-        total_loss += self.mel_loss_weight * loss_mel_speech
+        # 6. Music L1 Reconstruction Loss
+        if self.music_recon_weight > 0 and self.music_recon_loss_fn is not None:
+            min_len_music = min(music_est.shape[-1], music_tgt.shape[-1])
+            loss_music_recon_raw = self.music_recon_loss_fn(
+                music_est[..., :min_len_music],
+                music_tgt[..., :min_len_music]
+            )
+            total_loss += self.music_recon_weight * loss_music_recon_raw
 
-        # Return total loss for backprop and components for logging/evaluation
-        return total_loss, avg_loss_sisnr_speech, loss_mix_recon, loss_mel_speech, avg_loss_sisnr_music
+        # Return total_loss for backprop and raw (unweighted) components for logging
+        return total_loss, avg_loss_sisnr_speech_raw, loss_mix_recon_raw, loss_mel_speech_raw, avg_loss_sisnr_music_raw, loss_speech_recon_raw, loss_music_recon_raw
 
 
 # --- Evaluation Function (Modified for Direct Loss & Max Batches) ---
@@ -235,6 +289,8 @@ def evaluate(model, dataloader, loss_fn_eval, metrics_dict, device, desc="Evalua
     total_loss_sisnr_music = 0.0
     total_loss_mix_recon = 0.0
     total_loss_mel = 0.0
+    total_loss_speech_recon = 0.0 # New
+    total_loss_music_recon = 0.0  # New
     num_samples = 0
 
     # Reset metrics
@@ -277,13 +333,15 @@ def evaluate(model, dataloader, loss_fn_eval, metrics_dict, device, desc="Evalua
             mixture_for_loss = mixture.to(device)
             
             # Calculate loss using the provided loss function instance
-            _, batch_avg_loss_sisnr_speech, batch_loss_mix_recon, batch_loss_mel_speech, batch_avg_loss_sisnr_music = loss_fn_eval(
+            _, batch_avg_loss_sisnr_speech, batch_loss_mix_recon, batch_loss_mel_speech, batch_avg_loss_sisnr_music, batch_loss_speech_recon, batch_loss_music_recon = loss_fn_eval(
                 s_estimates, targets, x_mix_recon, mixture_for_loss # Pass original mixture for loss
             )
             total_loss_sisnr_speech += batch_avg_loss_sisnr_speech.item() * batch_size
             total_loss_sisnr_music += batch_avg_loss_sisnr_music.item() * batch_size
             total_loss_mix_recon += batch_loss_mix_recon.item() * batch_size
             total_loss_mel += batch_loss_mel_speech.item() * batch_size
+            total_loss_speech_recon += batch_loss_speech_recon.item() * batch_size # New
+            total_loss_music_recon += batch_loss_music_recon.item() * batch_size   # New
             accumulated_music_sisnr_metric += (-batch_avg_loss_sisnr_music.item()) * batch_size # SI-SNR metric is neg of loss
             accumulated_speech_sisnr_metric += (-batch_avg_loss_sisnr_speech.item()) * batch_size # SI-SNR metric is neg of loss
 
@@ -338,14 +396,29 @@ def evaluate(model, dataloader, loss_fn_eval, metrics_dict, device, desc="Evalua
         avg_loss_sisnr_music = total_loss_sisnr_music / num_samples
         avg_loss_mix_recon = total_loss_mix_recon / num_samples
         avg_loss_mel = total_loss_mel / num_samples
+        avg_loss_speech_recon = total_loss_speech_recon / num_samples # New
+        avg_loss_music_recon = total_loss_music_recon / num_samples   # New
         results["Loss_Speech(SI-SNR)"] = avg_loss_sisnr_speech
+        results["Loss_Music(SI-SNR)"] = avg_loss_sisnr_music # Ensure this key is added
         results["Loss_Mix(L1)"] = avg_loss_mix_recon
         results["Loss_Mel"] = avg_loss_mel
+        results["Loss_Speech_Recon(L1)"] = avg_loss_speech_recon # New
+        results["Loss_Music_Recon(L1)"] = avg_loss_music_recon   # New
         # Calculate total loss based on eval set averages (more stable)
-        results["Loss_Total"] = avg_loss_sisnr_speech + loss_fn_eval.mix_recon_weight * avg_loss_mix_recon + loss_fn_eval.mel_loss_weight * avg_loss_mel
-        if loss_fn_eval.include_music_loss:
-             results["Loss_Total"] += avg_loss_sisnr_music
-             results["Loss_Music(SI-SNR)"] = avg_loss_sisnr_music
+        eval_total_loss = 0.0
+        if loss_fn_eval.speech_sisnr_loss_weight > 0:
+            eval_total_loss += loss_fn_eval.speech_sisnr_loss_weight * avg_loss_sisnr_speech
+        if loss_fn_eval.music_sisnr_loss_weight > 0:
+            eval_total_loss += loss_fn_eval.music_sisnr_loss_weight * avg_loss_sisnr_music
+        if loss_fn_eval.mix_recon_weight > 0:
+            eval_total_loss += loss_fn_eval.mix_recon_weight * avg_loss_mix_recon
+        if loss_fn_eval.mel_loss_weight > 0: # runtime mel weight from loss_fn_eval
+            eval_total_loss += loss_fn_eval.mel_loss_weight * avg_loss_mel
+        if loss_fn_eval.speech_recon_weight > 0:
+            eval_total_loss += loss_fn_eval.speech_recon_weight * avg_loss_speech_recon
+        if loss_fn_eval.music_recon_weight > 0:
+            eval_total_loss += loss_fn_eval.music_recon_weight * avg_loss_music_recon
+        results["Loss_Total"] = eval_total_loss
 
         # Add separate speech and music SI-SNR metric values
         results["Speech_SI-SNR_Eval"] = accumulated_speech_sisnr_metric / num_samples
@@ -360,6 +433,8 @@ def evaluate(model, dataloader, loss_fn_eval, metrics_dict, device, desc="Evalua
         results["Loss_Music(SI-SNR)"] = 0.0
         results["Loss_Mix(L1)"] = 0.0
         results["Loss_Mel"] = 0.0
+        results["Loss_Speech_Recon(L1)"] = 0.0 # New default
+        results["Loss_Music_Recon(L1)"] = 0.0  # New default
         results["Loss_Total"] = 0.0
         results["Speech_SI-SNR_Eval"] = 0.0
         results["Music_SI-SNR_Eval"] = 0.0
@@ -453,16 +528,49 @@ def plot_losses(train_losses, val_losses, save_path, train_losses_components=Non
         print("Warning: Loss history is empty, skipping plotting.")
         return None
     
-    # Set up a multi-subplot figure based on what components we have
-    component_plots = 0
-    if train_losses_components and val_losses_components:
-        component_plots = 4 if include_music_loss else 3
+    epochs = range(1, len(train_losses) + 1)
+    epochs_len = len(epochs)
     
-    fig = plt.figure(figsize=(12, 6 + 3 * component_plots))
+    active_components_data = {}
+    if train_losses_components and val_losses_components:
+        component_names = ['speech_sisnr', 'mix_recon', 'mel', 'music_sisnr', 'speech_recon', 'music_recon']
+        component_titles = {
+            'speech_sisnr': 'Speech SI-SNR Loss (Raw)', 'mix_recon': 'Mixture Recon Loss (Raw)',
+            'mel': 'Mel Spectrogram Loss (Raw)', 'music_sisnr': 'Music SI-SNR Loss (Raw)',
+            'speech_recon': 'Speech L1 Recon Loss (Raw)', 'music_recon': 'Music L1 Recon Loss (Raw)'
+        }
+        component_labels = {
+            'speech_sisnr': ('Train Speech SI-SNR (Raw)', 'Val Speech SI-SNR (Raw)'),
+            'mix_recon': ('Train Mix Recon (Raw)', 'Val Mix Recon (Raw)'),
+            'mel': ('Train Mel (Raw)', 'Val Mel (Raw)'),
+            'music_sisnr': ('Train Music SI-SNR (Raw)', 'Val Music SI-SNR (Raw)'),
+            'speech_recon': ('Train Speech L1 (Raw)', 'Val Speech L1 (Raw)'),
+            'music_recon': ('Train Music L1 (Raw)', 'Val Music L1 (Raw)')
+        }
+
+        for name in component_names:
+            train_hist = train_losses_components.get(name, [])
+            val_hist = val_losses_components.get(name, [])
+            # Pad with zeros to match epoch length for `any` check
+            train_hist_padded = (train_hist + [0] * epochs_len)[:epochs_len]
+            val_hist_padded = (val_hist + [0] * epochs_len)[:epochs_len]
+
+            # A component is active if its history exists and contains any non-zero values
+            if (len(train_hist_padded) > 0 or len(val_hist_padded) > 0) and \
+               (any(x != 0 for x in train_hist_padded) or any(x != 0 for x in val_hist_padded)):
+                active_components_data[name] = {
+                    'title': component_titles[name],
+                    'train_label': component_labels[name][0],
+                    'val_label': component_labels[name][1],
+                    'train_data': train_hist_padded,
+                    'val_data': val_hist_padded
+                }
+                
+    num_active_component_plots = len(active_components_data)
+    fig = plt.figure(figsize=(12, 6 + 3 * num_active_component_plots))
     
     # Total loss plot (always included)
-    plt.subplot(1 + component_plots, 1, 1)
-    epochs = range(1, len(train_losses) + 1)
+    plt.subplot(1 + num_active_component_plots, 1, 1)
     plt.plot(epochs, train_losses, 'b-', label='Training Loss')
     plt.plot(epochs, val_losses, 'r-', label='Validation Loss')
     plt.title('Training and Validation Total Losses')
@@ -483,62 +591,19 @@ def plot_losses(train_losses, val_losses, save_path, train_losses_components=Non
                  xytext=(min_val_epoch, min_val_loss + (max(val_losses)-min_val_loss)*0.15), 
                  ha='center')
     
-    # If we have component losses, add subplots for each
-    if component_plots > 0 and train_losses_components and val_losses_components:
-        # Ensure all lists have the proper length
-        epochs_len = len(epochs)
-        
-        # Get loss components, ensuring proper length
-        train_speech_sisnr = train_losses_components.get('speech_sisnr', [0] * epochs_len)[:epochs_len]
-        val_speech_sisnr = val_losses_components.get('speech_sisnr', [0] * epochs_len)[:epochs_len]
-        train_mix_recon = train_losses_components.get('mix_recon', [0] * epochs_len)[:epochs_len]
-        val_mix_recon = val_losses_components.get('mix_recon', [0] * epochs_len)[:epochs_len]
-        train_mel = train_losses_components.get('mel', [0] * epochs_len)[:epochs_len]
-        val_mel = val_losses_components.get('mel', [0] * epochs_len)[:epochs_len]
-        
-        # Speech SI-SNR Loss
-        plt.subplot(1 + component_plots, 1, 2)
-        plt.plot(epochs, train_speech_sisnr, 'b-', label='Train Speech SI-SNR Loss')
-        plt.plot(epochs, val_speech_sisnr, 'r-', label='Val Speech SI-SNR Loss')
-        plt.title('Speech SI-SNR Loss')
-        plt.xlabel('Epochs')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.6)
-        
-        # Mix Reconstruction Loss
-        plt.subplot(1 + component_plots, 1, 3)
-        plt.plot(epochs, train_mix_recon, 'b-', label='Train Mix Recon Loss')
-        plt.plot(epochs, val_mix_recon, 'r-', label='Val Mix Recon Loss')
-        plt.title('Mixture Reconstruction Loss')
-        plt.xlabel('Epochs')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.6)
-        
-        # Mel Spectrogram Loss
-        plt.subplot(1 + component_plots, 1, 4)
-        plt.plot(epochs, train_mel, 'b-', label='Train Mel Loss')
-        plt.plot(epochs, val_mel, 'r-', label='Val Mel Loss')
-        plt.title('Mel Spectrogram Loss')
-        plt.xlabel('Epochs')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.6)
-        
-        # Music SI-SNR Loss (if included)
-        if include_music_loss and 'music_sisnr' in train_losses_components and 'music_sisnr' in val_losses_components:
-            train_music_sisnr = train_losses_components.get('music_sisnr', [0] * epochs_len)[:epochs_len]
-            val_music_sisnr = val_losses_components.get('music_sisnr', [0] * epochs_len)[:epochs_len]
-            
-            plt.subplot(1 + component_plots, 1, 5)
-            plt.plot(epochs, train_music_sisnr, 'b-', label='Train Music SI-SNR Loss')
-            plt.plot(epochs, val_music_sisnr, 'r-', label='Val Music SI-SNR Loss')
-            plt.title('Music SI-SNR Loss')
+    # If we have component losses, add subplots for each active one
+    if num_active_component_plots > 0:
+        plot_idx = 2 # Start from the second subplot position
+        for comp_name, data in active_components_data.items():
+            plt.subplot(1 + num_active_component_plots, 1, plot_idx)
+            plt.plot(epochs, data['train_data'], 'b-', label=data['train_label'])
+            plt.plot(epochs, data['val_data'], 'r-', label=data['val_label'])
+            plt.title(data['title'])
             plt.xlabel('Epochs')
             plt.ylabel('Loss')
             plt.legend()
             plt.grid(True, linestyle='--', alpha=0.6)
+            plot_idx += 1
     
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.tight_layout()
@@ -727,33 +792,29 @@ def train(args):
     # --- Optimizer ---
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    # --- Loss Function (Instantiate the WFAE loss WITHOUT PIT) ---
-    # Determine mel loss weight based on args
-    mel_weight_to_use = 0.0
-    if args.disable_mel_loss:
-        mel_weight_to_use = 0.0
-    elif args.mel_weight_decay:
-        mel_weight_to_use = args.mel_weight_initial  # Start with initial value
-    else:
-        mel_weight_to_use = args.mel_weight  # Use fixed value
+    # --- Loss Function ---
+    # Determine initial mel loss weight for the loss function constructor
+    # This is the weight the loss_fn starts with. Decay logic in epoch loop modifies loss_fn.mel_loss_weight.
+    initial_mel_constructor_weight = args.mel_weight
+    if args.mel_weight_decay:
+        initial_mel_constructor_weight = args.mel_weight_initial # Start with initial if decay is on
         
     loss_fn = MSHybridAEDirectLoss(
+        speech_sisnr_loss_weight=args.speech_sisnr_loss_weight,
+        music_sisnr_loss_weight=args.music_sisnr_loss_weight,
         mix_recon_weight=args.mix_recon_weight,
-        mel_loss_weight=mel_weight_to_use,
-        speech_target_index=0, # Dataset returns mix, speech, music
+        mel_loss_weight=initial_mel_constructor_weight, # This is the starting value for loss_fn.mel_loss_weight
+        speech_recon_weight=args.speech_recon_weight,
+        music_recon_weight=args.music_recon_weight,
+        speech_target_index=0, 
         music_target_index=1,
-        include_music_loss=args.include_music_loss, # Use new argument
         sample_rate=args.sr,
         n_fft=args.n_fft,
         hop_length=args.hop_length,
         n_mels=args.n_mels
     ).to(device)
     
-    # Explicitly ensure the mixer loss function and any mel loss is also on the correct device
-    if hasattr(loss_fn, 'mix_recon_loss_fn'):
-        loss_fn.mix_recon_loss_fn = loss_fn.mix_recon_loss_fn.to(device)
-    if hasattr(loss_fn, 'mel_loss_fn') and loss_fn.mel_loss_fn is not None:
-        loss_fn.mel_loss_fn = loss_fn.mel_loss_fn.to(device)
+    # The MSHybridAEDirectLoss.to() method handles moving internal loss_fn components like mel_loss_fn etc.
 
     # --- Metrics for Validation/Test ---
     pesq_mode = 'wb' if args.sr == 16000 else 'nb'
@@ -779,6 +840,8 @@ def train(args):
     train_sisnr_m_loss, val_sisnr_m_loss = [], []
     train_mix_recon_loss, val_mix_recon_loss = [], []
     train_mel_loss, val_mel_loss = [], []
+    train_speech_recon_loss_hist, val_speech_recon_loss_hist = [], [] # New history
+    train_music_recon_loss_hist, val_music_recon_loss_hist = [], []   # New history
     val_pesq_hist, val_stoi_hist = [], [] # For plotting metrics
     train_speech_si_snr, val_speech_si_snr = [], [] # For positive SI-SNR metrics
     train_music_si_snr, val_music_si_snr = [], [] # For positive SI-SNR metrics
@@ -808,6 +871,10 @@ def train(args):
             val_mix_recon_loss = checkpoint.get('val_mix_recon_loss', [])
             train_mel_loss = checkpoint.get('train_mel_loss', [])
             val_mel_loss = checkpoint.get('val_mel_loss', [])
+            train_speech_recon_loss_hist = checkpoint.get('train_speech_recon_loss_hist', []) # Load new
+            val_speech_recon_loss_hist = checkpoint.get('val_speech_recon_loss_hist', [])     # Load new
+            train_music_recon_loss_hist = checkpoint.get('train_music_recon_loss_hist', [])   # Load new
+            val_music_recon_loss_hist = checkpoint.get('val_music_recon_loss_hist', [])       # Load new
             val_pesq_hist = checkpoint.get('val_pesq_hist', [])
             val_stoi_hist = checkpoint.get('val_stoi_hist', [])
             train_speech_si_snr = checkpoint.get('train_speech_si_snr', [])
@@ -827,6 +894,8 @@ def train(args):
             train_sisnr_m_loss, val_sisnr_m_loss = [], []
             train_mix_recon_loss, val_mix_recon_loss = [], []
             train_mel_loss, val_mel_loss = [], []
+            train_speech_recon_loss_hist, val_speech_recon_loss_hist = [], [] # Reset new
+            train_music_recon_loss_hist, val_music_recon_loss_hist = [], []   # Reset new
             val_pesq_hist, val_stoi_hist = [], []
             train_speech_si_snr, val_speech_si_snr = [], []
             train_music_si_snr, val_music_si_snr = [], []
@@ -839,25 +908,34 @@ def train(args):
     for epoch in range(start_epoch, args.epochs):
         start_time = time.time()
         
-        # --- Update mel loss weight if using decay ---
-        if args.mel_weight_decay and not args.disable_mel_loss:
-            # Linear decay from initial value to 0 over mel_weight_decay_epochs
-            if epoch < args.mel_weight_decay_epochs:
-                current_mel_weight = args.mel_weight_initial * (1 - epoch / args.mel_weight_decay_epochs)
-            else:
-                current_mel_weight = 0.0
+        # --- Update mel loss weight in loss_fn if using decay ---
+        if args.mel_weight_decay: # Only apply decay if the flag is set
+            # Decay is based on mel_weight_initial, not args.mel_weight
+            if args.mel_weight_initial > 0: # Only decay if there was an initial weight to decay from
+                if epoch < args.mel_weight_decay_epochs:
+                    current_runtime_mel_weight = args.mel_weight_initial * (1 - epoch / args.mel_weight_decay_epochs)
+                else:
+                    current_runtime_mel_weight = 0.0
+                loss_fn.mel_loss_weight = current_runtime_mel_weight # Update loss_fn's runtime mel_loss_weight
                 
-            # Update loss function's mel weight
-            loss_fn.mel_loss_weight = current_mel_weight
-            print(f"Epoch {epoch+1}: Mel loss weight decayed to {current_mel_weight:.4f}")
-        
+                # Log less frequently or on change points
+                if epoch == 0 or (epoch +1) % args.log_interval == 0 or current_runtime_mel_weight == 0.0 and loss_fn.mel_loss_weight !=0:
+                     print(f"Epoch {epoch+1}: loss_fn.mel_loss_weight runtime updated to {loss_fn.mel_loss_weight:.4f} due to decay.")
+            # If mel_weight_initial was 0, mel_loss_weight in loss_fn remains 0 for decay scenario.
+        else:
+            # If not decaying, loss_fn.mel_loss_weight was set by initial_mel_constructor_weight (i.e. args.mel_weight)
+            # and remains fixed. No update needed here per epoch.
+            pass 
+
         model.train()
-        # --- Reset epoch loss accumulators ---
+        # --- Reset epoch loss accumulators for RAW (unweighted) losses ---
         epoch_total_loss = 0.0
         epoch_loss_sisnr_speech = 0.0
         epoch_loss_sisnr_music = 0.0
         epoch_loss_mix_recon = 0.0
         epoch_loss_mel = 0.0
+        epoch_loss_speech_recon = 0.0 # New accumulator
+        epoch_loss_music_recon = 0.0  # New accumulator
         num_train_samples = 0
         
         # Reset training metrics
@@ -883,7 +961,7 @@ def train(args):
             optimizer.zero_grad()
             s_estimates, x_mix_recon = model(mixture_input) # s_est:(B,N,C,T), mix_recon:(B,C,T)
             # Calculate batch losses using loss function instance
-            batch_total_loss, batch_avg_loss_sisnr_speech, batch_loss_mix_recon, batch_loss_mel_speech, batch_avg_loss_sisnr_music = loss_fn(
+            batch_total_loss, batch_avg_loss_sisnr_speech, batch_loss_mix_recon, batch_loss_mel_speech, batch_avg_loss_sisnr_music, batch_loss_speech_recon, batch_loss_music_recon = loss_fn(
                 s_estimates, targets, x_mix_recon, mixture_target
             )
 
@@ -904,6 +982,8 @@ def train(args):
             epoch_loss_sisnr_music += batch_avg_loss_sisnr_music.item() * batch_size # This is neg SI-SNR loss
             epoch_loss_mix_recon += batch_loss_mix_recon.item() * batch_size
             epoch_loss_mel += batch_loss_mel_speech.item() * batch_size
+            epoch_loss_speech_recon += batch_loss_speech_recon.item() * batch_size # Accumulate new
+            epoch_loss_music_recon += batch_loss_music_recon.item() * batch_size  # Accumulate new
             num_train_samples += batch_size
 
             # Update tqdm postfix (average over samples processed so far in epoch)
@@ -922,11 +1002,15 @@ def train(args):
         avg_epoch_loss_sisnr_music = epoch_loss_sisnr_music / num_train_samples
         avg_epoch_loss_mix_recon = epoch_loss_mix_recon / num_train_samples
         avg_epoch_loss_mel = epoch_loss_mel / num_train_samples
+        avg_epoch_loss_speech_recon = epoch_loss_speech_recon / num_train_samples # Calculate average
+        avg_epoch_loss_music_recon = epoch_loss_music_recon / num_train_samples   # Calculate average
         train_losses_total.append(avg_epoch_total_loss)
         train_sisnr_s_loss.append(avg_epoch_loss_sisnr_speech) # History list name kept for consistency with checkpoint loading
         train_sisnr_m_loss.append(avg_epoch_loss_sisnr_music) # History list name kept for consistency with checkpoint loading
         train_mix_recon_loss.append(avg_epoch_loss_mix_recon)
         train_mel_loss.append(avg_epoch_loss_mel)
+        train_speech_recon_loss_hist.append(avg_epoch_loss_speech_recon) # Append to new history
+        train_music_recon_loss_hist.append(avg_epoch_loss_music_recon)   # Append to new history
         train_speech_si_snr.append(-avg_epoch_loss_sisnr_speech) # Convert loss to positive SI-SNR metric
         train_music_si_snr.append(-avg_epoch_loss_sisnr_music)
         
@@ -950,13 +1034,16 @@ def train(args):
         val_sisnr_s_loss.append(val_results['Loss_Speech(SI-SNR)'])
         val_mix_recon_loss.append(val_results['Loss_Mix(L1)'])
         val_mel_loss.append(val_results['Loss_Mel'])
+        val_speech_recon_loss_hist.append(val_results['Loss_Speech_Recon(L1)']) # Append new val history
+        val_music_recon_loss_hist.append(val_results['Loss_Music_Recon(L1)'])   # Append new val history
         val_speech_si_snr.append(val_results['Speech_SI-SNR_Eval'])
         val_music_si_snr.append(val_results['Music_SI-SNR_Eval'])
         val_overall_si_snr.append(val_results['SI-SNR']) 
         if pesq_key and pesq_key in val_results: val_pesq_hist.append(val_results[pesq_key])
         if "STOI" in val_results: val_stoi_hist.append(val_results['STOI'])
-        if args.include_music_loss and 'Loss_Music(SI-SNR)' in val_results:
-            val_sisnr_m_loss.append(val_results['Loss_Music(SI-SNR)'])
+        # val_results['Loss_Music(SI-SNR)'] is 0 if music_sisnr_loss_weight was 0 in loss_fn_eval.
+        # Appending it directly ensures val_sisnr_m_loss has same length as other histories.
+        val_sisnr_m_loss.append(val_results['Loss_Music(SI-SNR)'])
 
         epoch_time = time.time() - start_time
 
@@ -968,6 +1055,7 @@ def train(args):
         # Train metrics
         print(f"TRAIN | Loss: {avg_epoch_total_loss:.4f}")
         print(f"       Mix Recon: {avg_epoch_loss_mix_recon:.4f} | Mel: {avg_epoch_loss_mel:.4f}")
+        print(f"       Speech L1 Recon: {avg_epoch_loss_speech_recon:.4f} | Music L1 Recon: {avg_epoch_loss_music_recon:.4f}") # Log new losses
         print(f"       Speech SI-SNR: {-avg_epoch_loss_sisnr_speech:.2f} dB | Music SI-SNR: {-avg_epoch_loss_sisnr_music:.2f} dB")
         print(f"       Overall SI-SNR: {overall_sisnr:.2f} dB")
 
@@ -976,6 +1064,7 @@ def train(args):
         print(f"VAL   | Loss: {avg_val_total_loss:.4f}" + (" (NEW BEST) ✓" if avg_val_total_loss < best_val_loss else ""))
         print(f"       Speech SI-SNR: {val_results['Speech_SI-SNR_Eval']:.2f} dB | Music SI-SNR: {val_results['Music_SI-SNR_Eval']:.2f} dB")
         print(f"       Mix Recon: {val_results['Loss_Mix(L1)']:.4f} | Mel: {val_results['Loss_Mel']:.4f}")
+        print(f"       Speech L1 Recon: {val_results['Loss_Speech_Recon(L1)']:.4f} | Music L1 Recon: {val_results['Loss_Music_Recon(L1)']:.4f}") # Log new val losses
         print(f"       Overall SI-SNR: {val_results['SI-SNR']:.2f} dB")
 
         if pesq_key in val_results: 
@@ -990,39 +1079,52 @@ def train(args):
         current_lr = optimizer.param_groups[0]['lr']
         writer.add_scalar('Training/learning_rate', current_lr, epoch+1)
         
-        # Log mel spectrogram weight if using decay
-        if args.mel_weight_decay and not args.disable_mel_loss:
-            writer.add_scalar('Training/mel_weight', loss_fn.mel_loss_weight, epoch+1)
+        # Log current runtime mel spectrogram weight from loss_fn
+        writer.add_scalar('Training/mel_loss_weight_runtime', loss_fn.mel_loss_weight, epoch+1)
 
-        # Log training metrics
-        writer.add_scalar('Loss/train_total', avg_epoch_total_loss, epoch+1)
-        writer.add_scalar('Loss/train_speech_sisnr', avg_epoch_loss_sisnr_speech, epoch+1)
-        writer.add_scalar('Loss/train_mix_recon', avg_epoch_loss_mix_recon, epoch+1)
-        writer.add_scalar('Loss/train_mel', avg_epoch_loss_mel, epoch+1)
-
-        # If music loss is included in backpropagation, log it as a loss component
-        if args.include_music_loss:
-            writer.add_scalar('Loss/train_music_sisnr', avg_epoch_loss_sisnr_music, epoch+1)
+        # Log TOTAL training loss (weighted sum)
+        writer.add_scalar('Loss_Total/train', avg_epoch_total_loss, epoch+1)
+        # Log RAW (unweighted) individual training losses IF their weights are active
+        if args.speech_sisnr_loss_weight > 0:
+            writer.add_scalar('Loss_Raw/train_speech_sisnr', avg_epoch_loss_sisnr_speech, epoch+1)
+        if args.music_sisnr_loss_weight > 0:
+            writer.add_scalar('Loss_Raw/train_music_sisnr', avg_epoch_loss_sisnr_music, epoch+1)
+        if args.mix_recon_weight > 0:
+            writer.add_scalar('Loss_Raw/train_mix_recon', avg_epoch_loss_mix_recon, epoch+1)
+        if loss_fn.mel_loss_weight > 0: # Check runtime mel weight in loss_fn for logging raw mel loss
+            writer.add_scalar('Loss_Raw/train_mel', avg_epoch_loss_mel, epoch+1)
+        if args.speech_recon_weight > 0:
+            writer.add_scalar('Loss_Raw/train_speech_recon_l1', avg_epoch_loss_speech_recon, epoch+1)
+        if args.music_recon_weight > 0:
+            writer.add_scalar('Loss_Raw/train_music_recon_l1', avg_epoch_loss_music_recon, epoch+1)
 
         # Log performance metrics (positive values for SI-SNR)
-        writer.add_scalar('Metrics/train_speech_sisnr', -avg_epoch_loss_sisnr_speech, epoch+1)
-        writer.add_scalar('Metrics/train_music_sisnr', -avg_epoch_loss_sisnr_music, epoch+1)
+        # These metrics are derived from raw losses, so log if the raw loss was meaningful (weight > 0)
+        if args.speech_sisnr_loss_weight > 0:
+            writer.add_scalar('Metrics/train_speech_sisnr_metric', -avg_epoch_loss_sisnr_speech, epoch+1)
+        if args.music_sisnr_loss_weight > 0:
+            writer.add_scalar('Metrics/train_music_sisnr_metric', -avg_epoch_loss_sisnr_music, epoch+1)
         writer.add_scalar('Metrics/train_overall_sisnr', overall_sisnr, epoch+1)
 
-        # Log validation metrics
-        writer.add_scalar('Loss/val_total', avg_val_total_loss, epoch+1)
-        writer.add_scalar('Loss/val_speech_sisnr', val_results['Loss_Speech(SI-SNR)'], epoch+1)
-        writer.add_scalar('Loss/val_mix_recon', val_results['Loss_Mix(L1)'], epoch+1)
-        writer.add_scalar('Loss/val_mel', val_results['Loss_Mel'], epoch+1)
+        # Log TOTAL validation loss (weighted sum)
+        writer.add_scalar('Loss_Total/val', avg_val_total_loss, epoch+1)
+        # Log RAW (unweighted) individual validation losses IF their weights were active during eval
+        if args.speech_sisnr_loss_weight > 0:
+             writer.add_scalar('Loss_Raw/val_speech_sisnr', val_results['Loss_Speech(SI-SNR)'], epoch+1)
+        if args.music_sisnr_loss_weight > 0:
+            writer.add_scalar('Loss_Raw/val_music_sisnr', val_results['Loss_Music(SI-SNR)'], epoch+1)
+        if args.mix_recon_weight > 0:
+            writer.add_scalar('Loss_Raw/val_mix_recon', val_results['Loss_Mix(L1)'], epoch+1)
+        if loss_fn.mel_loss_weight > 0: # Check runtime mel weight from loss_fn instance
+            writer.add_scalar('Loss_Raw/val_mel', val_results['Loss_Mel'], epoch+1)
+        if args.speech_recon_weight > 0:
+            writer.add_scalar('Loss_Raw/val_speech_recon_l1', val_results['Loss_Speech_Recon(L1)'], epoch+1)
+        if args.music_recon_weight > 0:
+            writer.add_scalar('Loss_Raw/val_music_recon_l1', val_results['Loss_Music_Recon(L1)'], epoch+1)
 
-        # Log music SI-SNR loss if included in training
-        if args.include_music_loss and 'Loss_Music(SI-SNR)' in val_results:
-            writer.add_scalar('Loss/val_music_sisnr', val_results['Loss_Music(SI-SNR)'], epoch+1)
-
-        # Log performance metrics
-        writer.add_scalar('Metrics/val_speech_sisnr', val_results['Speech_SI-SNR_Eval'], epoch+1)
-        writer.add_scalar('Metrics/val_music_sisnr', val_results['Music_SI-SNR_Eval'], epoch+1)
-        writer.add_scalar('Metrics/val_overall_sisnr', val_results['SI-SNR'], epoch+1)
+        # Log performance metrics from validation
+        writer.add_scalar('Metrics/val_speech_sisnr_metric', val_results['Speech_SI-SNR_Eval'], epoch+1)
+        writer.add_scalar('Metrics/val_music_sisnr_metric', val_results['Music_SI-SNR_Eval'], epoch+1)
 
         # Log additional metrics if available
         if pesq_key in val_results:
@@ -1035,13 +1137,17 @@ def train(args):
             'speech_sisnr': train_sisnr_s_loss, 
             'music_sisnr': train_sisnr_m_loss if train_sisnr_m_loss else [],
             'mix_recon': train_mix_recon_loss, 
-            'mel': train_mel_loss
+            'mel': train_mel_loss,
+            'speech_recon': train_speech_recon_loss_hist, # Pass new history for plotting
+            'music_recon': train_music_recon_loss_hist    # Pass new history for plotting
         }, {
             'speech_sisnr': val_sisnr_s_loss, 
             'music_sisnr': val_sisnr_m_loss if val_sisnr_m_loss else [],
             'mix_recon': val_mix_recon_loss, 
-            'mel': val_mel_loss
-        }, args.include_music_loss)
+            'mel': val_mel_loss,
+            'speech_recon': val_speech_recon_loss_hist, # Pass new history for plotting
+            'music_recon': val_music_recon_loss_hist    # Pass new history for plotting
+        }, args.music_sisnr_loss_weight > 0.0)
         writer.add_figure('Plots/loss', fig, epoch+1)
         fig = plot_si_snr(
             list(range(1, epoch+2)), 
@@ -1160,6 +1266,10 @@ def train(args):
                 "val_mix_recon_loss": val_mix_recon_loss,
                 "train_mel_loss": train_mel_loss,
                 "val_mel_loss": val_mel_loss,
+                "train_speech_recon_loss_hist": train_speech_recon_loss_hist, # Save new history
+                "val_speech_recon_loss_hist": val_speech_recon_loss_hist,     # Save new history
+                "train_music_recon_loss_hist": train_music_recon_loss_hist,   # Save new history
+                "val_music_recon_loss_hist": val_music_recon_loss_hist,       # Save new history
                 "val_pesq_hist": val_pesq_hist,
                 "val_stoi_hist": val_stoi_hist,
                 "train_speech_si_snr": train_speech_si_snr,
@@ -1202,14 +1312,18 @@ def train(args):
                 "music_sisnr": train_sisnr_m_loss if train_sisnr_m_loss else [],
                 "mix_recon": train_mix_recon_loss,
                 "mel": train_mel_loss,
+                "speech_recon": train_speech_recon_loss_hist, # Pass new history for plotting
+                "music_recon": train_music_recon_loss_hist    # Pass new history for plotting
             },
             {
                 "speech_sisnr": val_sisnr_s_loss,
                 "music_sisnr": val_sisnr_m_loss if val_sisnr_m_loss else [],
-                "mix_recon": val_mix_recon_loss,
+                "mix_recon": val_mix_recon_loss, 
                 "mel": val_mel_loss,
+                "speech_recon": val_speech_recon_loss_hist, # Pass new history for plotting
+                "music_recon": val_music_recon_loss_hist    # Pass new history for plotting
             },
-            args.include_music_loss,
+            args.music_sisnr_loss_weight > 0.0,
         )
         writer.add_figure('Plots/loss', fig, 0)
         # Need to adapt plot_si_snr to use new history lists
@@ -1266,11 +1380,12 @@ def train(args):
 
             # Recreate loss function for reporting loss on test set
             test_loss_fn = MSHybridAEDirectLoss(
+                speech_sisnr_loss_weight=args.speech_sisnr_loss_weight,
+                music_sisnr_loss_weight=args.music_sisnr_loss_weight,
                 mix_recon_weight=args.mix_recon_weight,
                 mel_loss_weight=loss_fn.mel_loss_weight if 'loss_fn' in locals() else (0.0 if args.disable_mel_loss else args.mel_weight),
-                speech_target_index=0, # Speech=0, Music=1
-                music_target_index=1,
-                include_music_loss=args.include_music_loss,
+                speech_recon_weight=args.speech_recon_weight, # Pass to test loss
+                music_recon_weight=args.music_recon_weight,   # Pass to test loss
                 sample_rate=args.sr,
                 n_fft=args.n_fft,
                 hop_length=args.hop_length,
@@ -1279,7 +1394,7 @@ def train(args):
 
             # Run evaluation on test set using the test dataloader
             test_results = evaluate(test_model, test_loader, test_loss_fn, test_metrics, device, 
-                                   desc="Testing (best model)", max_batches=0) # Pass test_loader
+                                   desc="Testing (best model)", max_batches=args.max_batches) # Pass test_loader and use args.max_batches
 
             print("\n" + "=" * 70)
             print(" FINAL TEST RESULTS ".center(70, "="))
@@ -1290,7 +1405,9 @@ def train(args):
             print(f"  Speech SI-SNR:    {test_results['Loss_Speech(SI-SNR)']:.4f}")
             print(f"  Mix Recon (L1):   {test_results['Loss_Mix(L1)']:.4f}")
             print(f"  Mel Loss:         {test_results['Loss_Mel']:.4f}")
-            if args.include_music_loss: 
+            print(f"  Speech L1 Recon:  {test_results['Loss_Speech_Recon(L1)']:.4f}") # Test results
+            print(f"  Music L1 Recon:   {test_results['Loss_Music_Recon(L1)']:.4f}")  # Test results
+            if args.music_sisnr_loss_weight > 0.0: 
                 print(f"  Music SI-SNR:     {test_results['Loss_Music(SI-SNR)']:.4f}")
 
             print(f"\nPERFORMANCE METRICS:")
@@ -1308,6 +1425,8 @@ def train(args):
             writer.add_scalar('Test/Loss_Speech_SISNR', test_results['Loss_Speech(SI-SNR)'], 0)
             writer.add_scalar('Test/Loss_Mix_L1', test_results['Loss_Mix(L1)'], 0)
             writer.add_scalar('Test/Loss_Mel', test_results['Loss_Mel'], 0)
+            writer.add_scalar('Test/Loss_Speech_Recon_L1', test_results['Loss_Speech_Recon(L1)'], 0) # TB Test
+            writer.add_scalar('Test/Loss_Music_Recon_L1', test_results['Loss_Music_Recon(L1)'], 0)   # TB Test
 
             writer.add_scalar('Test/SI-SNR_Overall', test_results['SI-SNR'], 0)
             writer.add_scalar('Test/Speech_SI-SNR', test_results['Speech_SI-SNR_Eval'], 0)
@@ -1323,6 +1442,8 @@ def train(args):
                 f"Loss Total: {test_results['Loss_Total']:.4f}\n"
                 f"Speech SI-SNR: {test_results['Speech_SI-SNR_Eval']:.2f} dB\n"
                 f"Music SI-SNR: {test_results['Music_SI-SNR_Eval']:.2f} dB\n"
+                f"Speech L1 Recon: {test_results['Loss_Speech_Recon(L1)']:.4f}\n"  # TB Test Summary
+                f"Music L1 Recon: {test_results['Loss_Music_Recon(L1)']:.4f}\n"    # TB Test Summary
             )
             if pesq_key in test_results:
                 test_summary += f"{pesq_key}: {test_results[pesq_key]:.2f}\n"
@@ -1511,17 +1632,30 @@ if __name__ == "__main__":
     parser.add_argument('--log_interval', type=int, default=100, help='Log training loss every N batches')
     parser.add_argument('--max_batches', type=int, default=0, help='Maximum number of batches per epoch (0 for all)')
 
-    # --- Loss Arguments ---
-    parser.add_argument('--mix_recon_weight', type=float, default=0.1, help='Weight for Mixture Reconstruction L1 loss component')
-    parser.add_argument('--mel_weight', type=float, default=0.05, help='Weight for Mel Spectrogram loss component for speech')
-    parser.add_argument('--disable_mel_loss', action='store_true', help='Disable Mel Spectrogram loss (overrides mel_weight)')
-    parser.add_argument('--mel_weight_decay', action='store_true', help='Enable linear decay of mel weight over epochs')
-    parser.add_argument('--mel_weight_initial', type=float, default=5.0, help='Initial mel weight when using decay')
-    parser.add_argument('--mel_weight_decay_epochs', type=int, default=5, help='Epoch by which mel weight reaches 0')
-    parser.add_argument('--include_music_loss', action='store_true', help='Include SI-SNR loss for music in backpropagation')
-    parser.add_argument('--n_fft', type=int, default=512, help='FFT size for Mel Spectrogram Loss')
-    parser.add_argument('--hop_length', type=int, default=128, help='Hop length for Mel Spectrogram Loss')
-    parser.add_argument('--n_mels', type=int, default=80, help='Number of Mel bins for Mel Spectrogram Loss')
+    # --- Loss Component Weights ---
+    parser.add_argument('--speech_sisnr_loss_weight', type=float, default=1.0, help='Weight for Speech SI-SNR loss. Default: 1.0')
+    parser.add_argument('--music_sisnr_loss_weight', type=float, default=0.0, help='Weight for Music SI-SNR loss. Default: 0.0 (disabled)')
+    parser.add_argument('--mix_recon_weight', type=float, default=0.1, help='Weight for Mixture L1 Reconstruction loss. Default: 0.1')
+    
+    parser.add_argument('--mel_weight', type=float, default=0.05, 
+                        help='Weight for Mel Spectrogram loss (speech). If mel_weight_decay is False, this is the fixed weight. If 0, Mel loss is disabled (unless overridden by decay settings). Default: 0.05')
+    # parser.add_argument('--disable_mel_loss', action='store_true', help='Disable Mel Spectrogram loss (overrides mel_weight)') # REMOVED
+    parser.add_argument('--mel_weight_decay', action='store_true', 
+                        help='Enable linear decay of mel weight from mel_weight_initial to 0 over mel_weight_decay_epochs.')
+    parser.add_argument('--mel_weight_initial', type=float, default=0.1, # Changed default to be more sensible if mel_weight is also low
+                        help='Initial mel weight when mel_weight_decay is True. Default: 0.1')
+    parser.add_argument('--mel_weight_decay_epochs', type=int, default=10, # Increased default decay epochs
+                        help='Number of epochs over which mel weight decays to 0 if decay is active. Default: 10')
+    
+    # parser.add_argument('--include_music_loss', action='store_true', help='Include SI-SNR loss for music in backpropagation') # REMOVED
+    
+    parser.add_argument('--speech_recon_weight', type=float, default=0.0, help='Weight for Speech L1 Reconstruction loss. Default: 0.0 (disabled)')
+    parser.add_argument('--music_recon_weight', type=float, default=0.0, help='Weight for Music L1 Reconstruction loss. Default: 0.0 (disabled)')
+
+    # --- Spectrogram/Mel Loss Parameters (shared by MelSpectrogramLoss and save_spectrogram) ---
+    parser.add_argument('--n_fft', type=int, default=512, help='FFT size for Mel/Spectrogram processing')
+    parser.add_argument('--hop_length', type=int, default=128, help='Hop length for Mel/Spectrogram processing')
+    parser.add_argument('--n_mels', type=int, default=80, help='Number of Mel bands for Mel Spectrogram processing') # Added n_mels
 
     # --- Model Hyperparameters ---
     # Match the MSHybridNet.__init__ arguments
@@ -1545,7 +1679,18 @@ if __name__ == "__main__":
     parser.add_argument('--test_samples_random', action='store_true', help='Use random samples for test audio instead of sequential')
 
     args = parser.parse_args()
-
+    # Print all argument values
+    import sys
+    
+    print("\n=== Command Line Arguments ===", file=sys.stderr)
+    for arg in vars(args):
+        print(f"{arg}: {getattr(args, arg)}", file=sys.stderr)
+    print("===============================\n", file=sys.stderr)
+    
+    print("\n=== Command Line Arguments ===")
+    for arg in vars(args):
+        print(f"{arg}: {getattr(args, arg)}")
+    print("===============================\n")
     # --- Basic Validation ---
     if args.sr not in [8000, 16000]:
         raise ValueError("PESQ metric requires sr=8000 or sr=16000")

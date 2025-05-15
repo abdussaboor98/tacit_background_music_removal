@@ -20,18 +20,28 @@ def load_model(checkpoint_path, device):
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
+    # Try to get model_args from checkpoint, default to an empty dict if not found
+    model_args = checkpoint.get('args', checkpoint.get('model_args', {}))
+    if not isinstance(model_args, dict): # Ensure model_args is a dictionary
+        print(f"Warning: Loaded model_args is not a dict: {type(model_args)}. Using empty dict instead.")
+        model_args = {}
+
     # Initialize HTDemucs model
+    # Use samplerate from model_args if available, otherwise default or make it a parameter
+    # For now, let's keep the hardcoded samplerate but acknowledge it might need changing
+    # based on how model_args are structured and used later.
+    # sr = model_args.get('sr', model_args.get('samplerate', 8000)) # Example if sr is in args
     model = HTDemucs(
         sources=["speech", "music"],
-        audio_channels=1,
-        samplerate=8000
+        audio_channels=1, # model_args.get('audio_channels', 1)
+        samplerate=8000   # sr
     ).to(device)
     
     # Load model weights
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()  # Set to evaluation mode
     
-    return model
+    return model, model_args
 
 
 def save_audio(tensor, filepath, sample_rate=8000):
@@ -164,7 +174,7 @@ def batch_separate(dataset_dir, output_dir=None, checkpoint_path=None, split="te
     print(f"Output will be saved to: {output_dir}")
     
     # Load model
-    model = load_model(checkpoint_path, device)
+    model, model_args = load_model(checkpoint_path, device)
     
     # Create dataset and dataloader
     dataset = FolderTripletDataset(Path(dataset_dir), split=split, segment=3.0, sr=sr)
