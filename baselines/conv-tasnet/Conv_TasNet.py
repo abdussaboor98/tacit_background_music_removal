@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 
+#######
+# Based on the code from https://github.com/JusperLee/Conv-TasNet
+#######
 
 class GlobalLayerNorm(nn.Module):
     '''

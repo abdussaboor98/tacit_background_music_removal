@@ -18,6 +18,10 @@ from separate_batch import load_model, save_audio, process_audio # Replaced copi
 
 import torchmetrics
 
+#######
+# Based on the code from https://github.com/facebookresearch/demucs
+#######
+
 # --- Copied/Adapted Helper Functions ---
 
 def save_spectrogram_eval(tensor, filepath, sample_rate=8000, n_fft=512, hop_length=128, title=None):

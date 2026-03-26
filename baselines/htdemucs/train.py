@@ -18,6 +18,11 @@ from demucs.htdemucs import HTDemucs
 from windowed_audio_datasets import FolderTripletDataset
 import torchmetrics
 
+
+#######
+# Based on the code from https://github.com/facebookresearch/demucs
+#######
+
 # --- Loss Functions ---
 class HTDemucsL1Loss(nn.Module):
     """
