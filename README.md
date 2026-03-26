@@ -110,15 +110,15 @@ The experiments are built from the following public datasets.
 
 ### Speech Dataset
 
-- `CSTR VCTK Corpus`: <https://datashare.ed.ac.uk/handle/10283/3443>
+- CSTR VCTK Corpus: <https://datashare.ed.ac.uk/handle/10283/3443>
 
 ### Music Dataset
 
-- `MUSDB18`: <https://sigsep.github.io/datasets/musdb.html>
+- MUSDB18: <https://sigsep.github.io/datasets/musdb.html>
 
 ### Environmental Sounds Dataset
 
-- `ESC-50`: <https://github.com/karolpiczak/ESC-50>
+- ESC-50: <https://github.com/karolpiczak/ESC-50>
 
 Practical path examples after extraction:
 
@@ -404,4 +404,18 @@ The TACIT and baseline training scripts automatically resume from the latest `ch
 
 ## 12. Citation 
 
-To be updated once the paper is published. 
+```
+@inproceedings{mohammedTACIT2026,
+  title = {TACIT: TCN And Conformer Integrated Two-stream Model for Background Music Removal},
+  author = {Mohammed, Abdus Saboor Gaffari and Ghebretatios, Solomon Iyassu and Alhosani, Latifa and Zualkernan, Imran},
+  year = {2026},
+  address = {Okinawa, Japan},
+  booktitle = {Proceedings of the 2026 12th International Conference on Computing and Artificial Intelligence},
+}
+```
+
+## 13. References
+
+Conv-TasNet - [Link 1](https://github.com/JusperLee/Conv-TasNet) | [Link 2](https://github.com/naplab/Conv-TasNet)
+
+HT Demucs - [Link](https://github.com/facebookresearch/demucs)
