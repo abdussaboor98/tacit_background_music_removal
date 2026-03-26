@@ -1,6 +1,9 @@
-# TACIT: Background Music Removal with a TCN and Conformer Integrated Two-Stream Network
+# TACIT: TCN And Conformer Integrated Two-stream model for Background Music Removal
 
-This repository contains code for background music removal from speech recordings. The main model, `TACIT` (`TCN And Conformer Integrated Two-stream`), separates an input mixture into:
+This repository contains code for the paper titled "TACIT: TCN And Conformer Integrated
+Two-stream model for Background Music Removal" (Accepted for publication, ICCAI 2026). 
+
+The main model, `TACIT` (`TCN And Conformer Integrated Two-stream`), separates an input mixture into:
 
 - a `speech` target containing speech plus environmental/background noise
 - a `music` target containing the background music component
@@ -398,3 +401,7 @@ The TACIT and baseline training scripts automatically resume from the latest `ch
 3. Train TACIT with `our/train_with_recon.py`.
 4. Evaluate `best_model.pth` using `our/evaluate_model.py`.
 5. Train and evaluate the baselines for comparison.
+
+## 12. Citation 
+
+To be updated once the paper is published. 
