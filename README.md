@@ -2,7 +2,15 @@
 
 This repository contains code for the paper titled "TACIT: TCN And Conformer Integrated
 Two-stream model for Background Music Removal" (Accepted for publication, ICCAI 2026). 
-
+```
+@inproceedings{mohammedTACIT2026,
+  title = {TACIT: TCN And Conformer Integrated Two-stream Model for Background Music Removal},
+  author = {Mohammed, Abdus Saboor Gaffari and Ghebretatios, Solomon Iyassu and Alhosani, Latifa and Zualkernan, Imran},
+  year = {2026},
+  address = {Okinawa, Japan},
+  booktitle = {Proceedings of the 2026 12th International Conference on Computing and Artificial Intelligence},
+}
+```
 The main model, **TACIT** (**T**CN **A**nd **C**onformer **I**ntegrated **T**wo-stream), separates an input mixture into:
 
 - a `speech` target containing speech plus environmental/background noise
@@ -402,19 +410,8 @@ The TACIT and baseline training scripts automatically resume from the latest `ch
 4. Evaluate `best_model.pth` using `our/evaluate_model.py`.
 5. Train and evaluate the baselines for comparison.
 
-## 12. Citation 
 
-```
-@inproceedings{mohammedTACIT2026,
-  title = {TACIT: TCN And Conformer Integrated Two-stream Model for Background Music Removal},
-  author = {Mohammed, Abdus Saboor Gaffari and Ghebretatios, Solomon Iyassu and Alhosani, Latifa and Zualkernan, Imran},
-  year = {2026},
-  address = {Okinawa, Japan},
-  booktitle = {Proceedings of the 2026 12th International Conference on Computing and Artificial Intelligence},
-}
-```
-
-## 13. References
+## 12. References
 
 Conv-TasNet - [Link 1](https://github.com/JusperLee/Conv-TasNet) | [Link 2](https://github.com/naplab/Conv-TasNet)
 
